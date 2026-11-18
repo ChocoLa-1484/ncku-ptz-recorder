@@ -14,7 +14,7 @@ PyQt5 GUI，錄影與解碼交給 ffmpeg 子行程，可選用 go2rtc 做本機 
 |---|---|
 | OS | Windows 10/11 |
 | Python | **3.14**，裝在專案根目錄的 `.venv\`。建議用 [uv](https://docs.astral.sh/uv/) 建立（會自動下載 Python 3.14，不用另外安裝）。早期的 conda `ptz` 3.9 環境已棄用 |
-| GPU | Intel iGPU（Iris Xe 等），預覽/回放解碼走 QSV（`h264_qsv`）。建議在 Windows 圖形設定把 `python.exe` / 打包後 exe 設「省電」強制走 iGPU |
+| GPU | Intel iGPU（Iris Xe 等），預覽/回放解碼走 QSV（`h264_qsv`）。建議在 Windows 圖形設定把 `python.exe` / 打包後 exe 設「省電」強制走 iGPU。沒有 Intel iGPU 時 `utils/hwaccel.py` 會自動改用 NVIDIA CUDA（NVDEC），再不行才用 CPU 軟解；可用環境變數 `PTZ_HWACCEL=qsv/cuda/sw` 強制指定 |
 | 網路 | 與相機同網段（預設 `10.30.3.0/24`），RTSP 走 TCP |
 | 硬碟 | 錄影檔很大（1080p120，~1.5 GB/分/路）；NAS 模式先寫本機 TEMP 再背景複製 |
 

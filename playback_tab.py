@@ -18,6 +18,7 @@ from PyQt5.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QImage, QPixmap
 
 from utils.icons_utils import resource_path
+from utils.hwaccel import get_hwaccel, decode_input_args, build_vf
 
 
 DISPLAY_FPS       = 60                                  # 顯示幀率（同 ffmpeg -vf fps）
@@ -126,12 +127,13 @@ class _CameraDecoder:
     def start(self, seek_time_s: float = 0.0) -> bool:
         """重新啟動 ffmpeg subprocess 跳到 seek_time_s。回傳 True 即啟動成功。"""
         self.stop()
+        _hw = get_hwaccel(_FFMPEG_EXE)
         cmd = [
             _FFMPEG_EXE, "-hide_banner", "-loglevel", "error",
             "-ss", f"{max(0.0, seek_time_s):.3f}",
-            "-hwaccel", "qsv", "-hwaccel_output_format", "qsv", "-c:v", "h264_qsv",
+            *decode_input_args(_hw),
             "-i", self.path,
-            "-vf", f"fps={self.fps},hwdownload,format=nv12,scale={self.W}:{self.H}",
+            "-vf", build_vf(_hw, self.fps, (self.W, self.H)),
             "-pix_fmt", "bgr24", "-f", "rawvideo", "-an", "pipe:1",
         ]
         self.eof        = False

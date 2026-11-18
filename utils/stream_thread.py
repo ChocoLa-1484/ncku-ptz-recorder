@@ -25,6 +25,7 @@ from PyQt5.QtGui import QImage, QPixmap
 from .ui_utils import _ensure_pixitem
 from .icons_utils import resource_path
 from .app_config import get_camera_credentials, ENV_USER, ENV_PASS
+from .hwaccel import get_hwaccel, decode_input_args, build_vf
 
 # ffmpeg 執行檔位置：
 #   PyInstaller 打包 → 從 _MEIPASS 找 ffmpeg.exe
@@ -34,6 +35,11 @@ def _resolve_ffmpeg_exe() -> str:
     return p if os.path.isfile(p) else "ffmpeg"
 
 _FFMPEG_EXE = _resolve_ffmpeg_exe()
+
+# 主行程 import 時就探測一次解碼後端（qsv/cuda/sw），結果存進環境變數，
+# 之後 spawn 的 camera worker 子行程直接繼承，不會 8 路各自重探。
+if mp.current_process().name == "MainProcess":
+    get_hwaccel(_FFMPEG_EXE)
 
 # Windows 上 spawn ffmpeg 子進程預設會開 console 視窗，8 台相機 = 8 個黑窗。
 # 用 CREATE_NO_WINDOW 把它隱藏；非 Windows 平台這個 flag 不存在，給 0。
@@ -261,8 +267,9 @@ def camera_worker_process(
     _pw, _ph = preview_hw
     out_w, out_h = (_pw, _ph) if _pw > 0 else (frame_w, frame_h)
     _do_scale = _pw > 0
+    _hw = get_hwaccel(_FFMPEG_EXE)
     print(f"[{camera_name}] Worker 探測完成 (stream0) {frame_w}x{frame_h} @ {_src_fps:.1f}fps "
-          f"→ ffmpeg h264_qsv → {out_w}x{out_h} @ {ui_fps}fps")
+          f"→ ffmpeg {_hw} decode → {out_w}x{out_h} @ {ui_fps}fps")
     FRAME_BYTES = out_w * out_h * 3
     MAX_RETRIES = 10
 
@@ -286,13 +293,11 @@ def camera_worker_process(
         #     不用 scale_qsv：在 ffmpeg 8.x + Iris Xe 上開 8 路會踩 D3D11 texture pool bug
         #     (E_INVALIDARG)，且 NV12 要求偶數尺寸（225 是奇數會直接拒絕）。
         #   stderr=PIPE + drain thread：上次失敗就是 DEVNULL 把 QSV 錯誤吃光。
-        if _do_scale:
-            vf = f"fps={ui_fps},hwdownload,format=nv12,scale={out_w}:{out_h}"
-        else:
-            vf = f"fps={ui_fps},hwdownload,format=nv12"
+        #   非 Intel 機器（無 iGPU）由 utils/hwaccel.py 自動改走 cuda 或 CPU 軟解。
+        vf = build_vf(_hw, ui_fps, (out_w, out_h) if _do_scale else None)
         cmd = [
             _FFMPEG_EXE, "-hide_banner", "-loglevel", "error",
-            "-hwaccel", "qsv", "-hwaccel_output_format", "qsv", "-c:v", "h264_qsv",
+            *decode_input_args(_hw),
             "-rtsp_transport", "tcp",
             # 拿掉 nobuffer + low_delay：原本為了低延遲，但讓 H.264 IDR keyframe burst
             # (1~2 秒一次) 直接打到 UI → 週期性卡頓。改用 thread_queue_size 給 demuxer
