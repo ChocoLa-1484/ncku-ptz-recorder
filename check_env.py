@@ -5,7 +5,7 @@
 逐項檢查並告訴你哪裡有問題、要怎麼修：
   1. Python 套件      2. ffmpeg / ffprobe / go2rtc     3. config.ini 帳密
   4. wsdl 檔名        5. 8 台 PTZ：網路、RTSP 帳密、ONVIF port
-  6. go2rtc 轉流      7. 8 台同時收流（頻寬）  8. 解碼後端  9. NAS（僅提醒）
+  6. go2rtc 殘留 / 8554 port / 轉流  7. 8 台同時收流（頻寬）  8. 解碼後端  9. NAS（僅提醒）
 全部 OK 才代表 App 開起來 8 台會有畫面。
 """
 import os
@@ -135,10 +135,34 @@ for name, ip, ok, why, onvif_port in cam_rows:
 
 # ── 6. go2rtc 轉流 ───────────────────────────────────────────────
 section("6. go2rtc 本機轉流（App 實際使用的路徑）")
+# 先看有沒有「上次 App 當掉 / 被強制關閉」留下的孤兒 go2rtc，以及 8554 port 實際是誰佔著。
+# 孤兒會佔住 8554，讓新開的 App 一直連到舊的 go2rtc（例如帶著當時錯誤帳密）→ 部分相機連不上。
+from utils.proc_utils import find_orphan_go2rtc_pids, port_listener_pid, process_name
+
+orphans = find_orphan_go2rtc_pids() if sys.platform == "win32" else []
+port_pid = port_listener_pid(8554)
+if orphans:
+    report(None, "殘留 go2rtc",
+           f"有 {len(orphans)} 個上次沒關掉的 go2rtc（PID {', '.join(map(str, orphans))}）"
+           f"{'，正佔著 8554 port' if port_pid in orphans else ''}；下面測試 / App 啟動時會自動清除")
+else:
+    report(True, "殘留 go2rtc", "沒有")
+
+port_busy_by_other = port_pid is not None and port_pid not in orphans
+if port_busy_by_other:
+    pname = process_name(port_pid)
+    if pname.lower() == "go2rtc.exe":
+        report(None, "8554 port", f"被正在執行的 App 的 go2rtc 使用（PID {port_pid}）；請關掉 App 再檢查")
+    else:
+        report(False, "8554 port", f"被其他程式 {pname}（PID {port_pid}）佔用 → App 的 go2rtc 會綁不到 port，"
+                                   f"請關掉該程式或改 go2rtc.yaml / stream_thread.py 的 port")
+else:
+    report(True, "8554 port", "可用" if port_pid is None else "目前被殘留 go2rtc 佔用，測試時會清除")
+
 if not (exe_ok.get("go2rtc.exe") and exe_ok.get("ffprobe.exe")):
     report(False, "go2rtc", "缺 go2rtc.exe 或 ffprobe.exe，跳過")
-elif tcp_open("127.0.0.1", 8554, 0.5):
-    report(None, "go2rtc", "8554 port 已被佔用（App 可能正在執行），跳過；請關掉 App 再檢查")
+elif port_busy_by_other:
+    report(None, "go2rtc 轉流測試", "8554 port 被佔用，跳過")
 else:
     from utils.stream_thread import maybe_start_go2rtc, stop_go2rtc
     proc = maybe_start_go2rtc()
