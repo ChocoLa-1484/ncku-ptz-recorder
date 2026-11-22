@@ -154,9 +154,21 @@ password = 相機密碼
 
 | 分頁 | 檔案 | 功能 |
 |---|---|---|
-| 單機攝影機 | `ptz_control/camera_tab_control.py` | 選一台相機看大畫面、ONVIF PTZ 方向/zoom 控制（限 `Ptz*`）、單路錄影。錄影中會顯示紅點 `recording_status_label` |
+| 單機攝影機 | `ptz_control/camera_tab_control.py` | 選一台相機看大畫面、ONVIF PTZ 方向/zoom 控制（限 `Ptz*`）、單路錄影。錄影中會顯示紅點 `recording_status_label`。「影像設定…」可直接調相機畫面（見下方「相機影像設定」） |
 | 多機攝影機 | `ptz_control/multi_camera_tab.py` | 2×4 格線同時預覽 8 台 `Ptz01~Ptz08`、勾選多台同步錄影、可勾選要不要連線（壓力測試承載上限）。點格子會開「放大」分頁（`enlarge_tab.py`） |
 | 同步播放 | `playback_tab.py` | 選一個錄影資料夾，依相機名前綴配對 mp4，8 路同步回放。依各檔第一幀的時間戳記（PTS `start_time`）對齊（`ALIGN_MODE = "pts"`），見下方「多路同步」 |
+
+### 相機影像設定（單機分頁「影像設定…」）
+
+連上 `Ptz*` 相機後按「影像設定…」，用 ONVIF Imaging 直接調相機本身的參數，大畫面立即看到效果，不必再開相機網頁：
+
+- 亮度 / 對比 / 飽和度（0~100）、銳利度（0~31）、寬動態（WDR）、白平衡（自動 / 手動 + 紅藍增益 1~255）。**曝光**沒有透過 ONVIF 開放，要到相機網頁調。
+- 寫入是 `ForcePersistence`：**存在相機裡、重開機也保留，使用這台相機的其他系統（轉播等）也會看到變化**。
+- 某台相機第一次被 App 修改前，原始值會自動備份到 `camera_imaging_backup.json`（exe 或專案根目錄，已 gitignore），之後不會被覆蓋 →「還原成原始備份」永遠回得去。「復原本次修改」回到打開視窗時的值。
+- 「從其他相機複製」可把某台的設定整組套到這台，方便 8 台統一色調。
+- 韌體怪癖：數值必須以整數送出。送 `144.0` 時相機會讀回 `144.0.0`（無法解析），`utils/camera_imaging.py` 已一律送整數。
+
+App 本身不改顏色：預覽 / 回放依串流標示的全幅 BT.709 轉 RGB（實測與標準轉換平均差 < 1 色階），8 台看起來不同是相機設定不同。
 
 ---
 
@@ -284,6 +296,7 @@ ptz_control/
   camera_tab_control.py     單機攝影機分頁
   multi_camera_tab.py       多機攝影機分頁
   ptz_control.py            ONVIF PTZ 控制（AbsoluteMove）
+  imaging_dialog.py         「影像設定」視窗（亮度 / 對比 / 白平衡…）
   ptz_control_ui.py         單機分頁版面（手動維護！）
 
 utils/
@@ -292,6 +305,7 @@ utils/
   app_config.py             讀 config.ini / 環境變數取得相機帳密
   icons_utils.py            resource_path（開發 / PyInstaller 兩用）
   ui_utils.py               _ensure_pixitem
+  camera_imaging.py         ONVIF Imaging 讀寫 + 原始值備份（camera_imaging_backup.json）
   camera_check.py           連線失敗時繞過 go2rtc 直連相機，判斷是帳密錯誤還是網路不通
 
 wsdl/                        ONVIF WSDL（onvif_zeep 需要，路徑顯式指過去）

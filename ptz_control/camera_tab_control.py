@@ -14,6 +14,7 @@ from .ptz_control_ui import Ui_ptz_control
 from utils.stream_thread import StreamThread, USE_GO2RTC
 from utils.save_location import nas_reachable, ask_local_dir_when_nas_missing
 from .ptz_control import ptzControl
+from .imaging_dialog import ImagingDialog
 from utils.icons_utils import resource_path
 
 # health_timer：串流意外斷線時自動重連。間隔拉長到 15s（原本 5s 會讓連不上的
@@ -64,6 +65,7 @@ class PtzTabControl(QWidget):
         self._init_camera_map()
         self._build_save_location_panel()
         self._build_keep_preview_checkbox()
+        self._build_imaging_button()
         self._bind_ui()
         self._disable_control_buttons()
         if hasattr(self.ui, "recording_status_label"):
@@ -201,6 +203,39 @@ class PtzTabControl(QWidget):
         if hasattr(self.ui, "record_layout"):
             self.ui.record_layout.addWidget(self.chk_keep_preview, 2, 0, 1, 3)
 
+    def _build_imaging_button(self):
+        """PTZ 控制區最下方加「影像設定…」：直接調相機亮度 / 對比 / 白平衡等（ONVIF Imaging）。"""
+        self.imaging_dialog = None
+        self.btn_imaging = QPushButton("影像設定…")
+        self.btn_imaging.setMinimumHeight(30)
+        self.btn_imaging.setToolTip("調整這台相機的亮度、對比、飽和度、銳利度、白平衡（直接寫進相機）")
+        self.btn_imaging.setEnabled(False)
+        self.btn_imaging.clicked.connect(self._open_imaging_dialog)
+        if hasattr(self.ui, "ptz_layout"):
+            self.ui.ptz_layout.addWidget(self.btn_imaging, 6, 0, 1, 3)
+
+    def _open_imaging_dialog(self):
+        name = self.ui.camera_select_combobox.currentText()
+        ip = self.camera_map.get(name)
+        if not ip:
+            return
+        dlg = self.imaging_dialog
+        if dlg is not None and dlg.isVisible() and dlg.name == name:
+            dlg.raise_(); dlg.activateWindow()
+            return
+        self._close_imaging_dialog()
+        self.imaging_dialog = ImagingDialog(name, ip, self.camera_map, self)
+        self.imaging_dialog.destroyed.connect(lambda *_: setattr(self, "imaging_dialog", None))
+        self.imaging_dialog.show()
+
+    def _close_imaging_dialog(self):
+        dlg, self.imaging_dialog = self.imaging_dialog, None
+        if dlg is not None:
+            try:
+                dlg.close()
+            except RuntimeError:   # 已被 Qt 刪除
+                pass
+
     def _browse_save_path(self):
         folder = QFileDialog.getExistingDirectory(self, "選擇存檔資料夾")
         if folder:
@@ -235,6 +270,8 @@ class PtzTabControl(QWidget):
                 getattr(self.ui, name).setEnabled(True)
 
     def _disable_control_buttons(self):
+        if hasattr(self, "btn_imaging"):
+            self.btn_imaging.setEnabled(False)
         for name in ("move_left_button","move_right_button","move_up_button","move_down_button",
                      "zoom_in_button","zoom_out_button","start_record_button","stop_record_button"):
             if hasattr(self.ui, name):
@@ -242,6 +279,7 @@ class PtzTabControl(QWidget):
 
     def _close_stream_thread(self):
         self.stop_recording()
+        self._close_imaging_dialog()
         t = self.stream_thread
         if t is not None:
             try: t.stop()
@@ -324,6 +362,8 @@ class PtzTabControl(QWidget):
             self._enable_control_buttons()
         else:
             self._enable_record_buttons_only()
+        # 影像設定走獨立的 ONVIF 連線，PTZ 控制失敗也可能可用 → 只看是不是 Ptz 機型
+        self.btn_imaging.setEnabled(name.startswith("Ptz"))
         if hasattr(self.ui, "connect_camera_button"):
             self.ui.connect_camera_button.setText("停止串流")
             self.ui.connect_camera_button.setEnabled(True)

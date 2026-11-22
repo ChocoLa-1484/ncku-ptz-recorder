@@ -36,3 +36,7 @@ config.ini
 !.vscode/launch.json
 !.vscode/settings.json
 !.vscode/extensions.json
+
+# ── 影像設定原始值備份（各相機本機狀態）──
+camera_imaging_backup.json
+camera_imaging_backup.json.tmp
