@@ -64,6 +64,38 @@ def _build_rtsp_url(camera_ip, camera_name, user, pwd, port, stream_path="stream
     return f"rtsp://{user}:{pwd}@{camera_ip}:{port}/{stream_path}"
 
 
+def _port_in_use(host: str, port: int) -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host, port)) == 0
+
+
+def _kill_stale_go2rtc():
+    """關掉上次 App 沒正常結束（當掉 / 強制停止除錯）留下的 go2rtc.exe。
+
+    殘留的舊 go2rtc 會繼續佔著 8554 埠，新啟動的 go2rtc 綁不到埠，App 就一直連到
+    那個舊的；舊的若卡在壞狀態，部分相機會回 RTSP 404（實際遇過：Ptz01/03/04/05/07/08
+    連不上、02/06 正常，而直連相機全部正常）。
+    """
+    if os.name != "nt":
+        return
+    try:
+        r = subprocess.run(["taskkill", "/F", "/IM", "go2rtc.exe"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           timeout=10, creationflags=_NO_WINDOW)
+    except Exception as e:
+        print(f"[go2rtc] 清除殘留 go2rtc 失敗: {e}")
+        return
+    if r.returncode == 0:
+        print("[go2rtc] 已關閉上次殘留的 go2rtc.exe")
+        # 等 OS 釋放埠
+        for _ in range(20):
+            if not _port_in_use(GO2RTC_HOST, GO2RTC_PORT):
+                break
+            time.sleep(0.1)
+
+
 def maybe_start_go2rtc():
     """USE_GO2RTC=True 時啟動本機 go2rtc（讀 go2rtc.yaml）。回傳 Popen 或 None。
     在主程序啟動時呼叫一次即可（不要每台相機都叫）。"""
@@ -75,6 +107,10 @@ def maybe_start_go2rtc():
         print(f"[go2rtc] 找不到 {exe}！請下載 go2rtc.exe 放到專案根目錄，"
               f"或把 USE_GO2RTC 設回 False（否則連不到相機）。")
         return None
+    _kill_stale_go2rtc()
+    if _port_in_use(GO2RTC_HOST, GO2RTC_PORT):
+        print(f"[go2rtc] 警告：{GO2RTC_HOST}:{GO2RTC_PORT} 已被其他程式佔用，"
+              f"App 可能連到錯的 RTSP 服務。請用 `netstat -ano | findstr {GO2RTC_PORT}` 找出並關閉它。")
     try:
         # go2rtc.yaml 用 ${PTZ_CAMERA_USER} / ${PTZ_CAMERA_PASS} 取帳密，這裡從 config.ini 帶入環境變數
         user, pwd = get_camera_credentials()
