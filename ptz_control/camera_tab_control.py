@@ -366,8 +366,11 @@ class PtzTabControl(QWidget):
         if self._reconnect_fails >= MAX_RECONNECT_ATTEMPTS:
             if self._reconnect_fails == MAX_RECONNECT_ATTEMPTS:
                 self._reconnect_fails += 1   # 只印一次，之後安靜
+                _why = getattr(self.stream_thread, "last_error", None) or "原因不明"
                 print(f"[單機] 連續重連失敗 {MAX_RECONNECT_ATTEMPTS} 次，停止重試。"
-                      f"請確認相機狀態後重新按「讀取串流」。")
+                      f"原因：{_why}。排除後重新按「讀取串流」。")
+                QMessageBox.warning(self, "串流連線失敗",
+                                    f"連續重連失敗 {MAX_RECONNECT_ATTEMPTS} 次，已停止重試。\n\n原因：{_why}")
             return
 
         self._reconnect_fails += 1

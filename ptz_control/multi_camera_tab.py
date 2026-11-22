@@ -452,9 +452,10 @@ class MultiCameraTab(QWidget):
                 if self._reconnect_fails[i] == MAX_RECONNECT_ATTEMPTS:
                     # 只在剛放棄的那一拍印一次 log + 標示畫面，之後安靜
                     self._reconnect_fails[i] += 1   # 讓上面的相等條件不再成立
+                    _why = getattr(t, "last_error", None) or "原因不明"
                     print(f"[{_name}] 連續重連失敗 {MAX_RECONNECT_ATTEMPTS} 次，停止重試。"
-                          f"請確認相機狀態後重新勾選「連線相機」。")
-                    self._mark_reconnect_gaveup(i)
+                          f"原因：{_why}。排除後重新勾選「連線相機」。")
+                    self._mark_reconnect_gaveup(i, _why)
                 continue
 
             self._reconnect_fails[i] += 1
@@ -472,14 +473,20 @@ class MultiCameraTab(QWidget):
             self.threads[i] = new_th
             new_th.start()
 
-    def _mark_reconnect_gaveup(self, idx: int):
-        # 在該相機格線畫面標示「連線失敗」，跟「未連線」（使用者主動斷）做區別
+    def _mark_reconnect_gaveup(self, idx: int, reason: str = ""):
+        # 在該相機格線畫面標示「連線失敗」+ 原因，跟「未連線」（使用者主動斷）做區別
         scene = self.scenes[idx]
         scene.clear()
         txt = scene.addText("連線失敗，停止重試")
         txt.setDefaultTextColor(Qt.red)
         txt.setFont(QFont("Arial", 14, QFont.Bold))
-        txt.setPos(90, 95)
+        txt.setPos(90, 80)
+        if reason:
+            why = scene.addText(reason)
+            why.setDefaultTextColor(Qt.yellow)
+            why.setFont(QFont("Arial", 10, QFont.Bold))
+            why.setTextWidth(360)
+            why.setPos(20, 115)
 
     # ── 錄影控制 ───────────────────────────────────────────────────────
     def _start_selected_recording(self):

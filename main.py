@@ -95,6 +95,7 @@ def _run():
             super().closeEvent(event)
 
     app = QApplication(sys.argv)
+    _warn_if_credentials_unset()
     window = Main()
     # cell 已改為跟視窗等比縮放（multi_camera_tab / playback_tab 的 resizeEvent），
     # 所以視窗最小設小一點，讓使用者真的能拖小視窗。1200×700 是 cell 280×157 的下限。
@@ -113,7 +114,61 @@ def _run():
     sys.exit(app.exec_())
 
 
+def _setup_utf8_console():
+    """讓終端機的中文 log 不變亂碼。
+
+    Windows 終端機預設字碼頁是 cp950（Big5），但 VS Code / 重導向 / 子行程
+    各自用不同編碼輸出 → 中文變亂碼。統一成 UTF-8：
+      1. 主控台字碼頁設 65001（UTF-8），程式結束時還原原本的字碼頁。
+      2. 本行程 stdout/stderr 改用 UTF-8。
+      3. PYTHONIOENCODING 寫進環境變數，multiprocessing spawn 出來的相機
+         worker 行程會繼承，print 也是 UTF-8。
+    """
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+    if sys.platform == "win32":
+        try:
+            import ctypes, atexit
+            k32 = ctypes.windll.kernel32
+            old_cp = k32.GetConsoleOutputCP()
+            if old_cp and old_cp != 65001 and k32.SetConsoleOutputCP(65001):
+                atexit.register(k32.SetConsoleOutputCP, old_cp)
+        except Exception:
+            pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass   # 打包成 --noconsole 時 stream 可能是 None
+
+
+def _warn_if_credentials_unset():
+    """config.ini 不進版控，新 clone 的電腦常忘了填帳密。這時只有不需帳密的
+    Ptz02 / Ptz06 有畫面、其他全部「連線失敗」，很容易誤以為是網路問題。
+    啟動時先檢查，帳密是空的或還是範本值就直接跳視窗講清楚。"""
+    from PyQt5.QtWidgets import QMessageBox
+    from utils.app_config import get_camera_credentials
+    from utils.camera_check import credentials_look_unset
+    user, pwd = get_camera_credentials()
+    if credentials_look_unset(user, pwd):
+        print("[config] ⚠ 相機帳密未設定（config.ini 不存在或仍是範本值）")
+        QMessageBox.warning(
+            None, "相機帳密未設定",
+            "config.ini 不存在，或帳密仍是範本值（your_camera_user / your_camera_password）。\n\n"
+            "沒有正確帳密時，只有 Ptz02、Ptz06 會有畫面，其他相機都會連線失敗。\n\n"
+            "請在程式資料夾把 config.example.ini 複製成 config.ini，填入相機帳密後重新啟動。")
+
+
+def _chdir_to_app_dir():
+    """icons/、wsdl/、ffmpeg.exe、go2rtc.exe 都是相對工作目錄找的。
+    從別的資料夾啟動（例如 python C:\\...\\main.py）會全部找不到 → 相機全連不上。
+    開發模式下一律切到 main.py 所在資料夾；打包版資源在 _MEIPASS，不受影響。"""
+    if not getattr(sys, "frozen", False):
+        os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+
 if __name__ == "__main__":
+    _chdir_to_app_dir()
+    _setup_utf8_console()
     os.environ.setdefault("OPENCV_VIDEOIO_TIMEOUT_MSEC", "5000")
     mp.freeze_support()
     _run()

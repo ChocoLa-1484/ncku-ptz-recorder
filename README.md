@@ -112,6 +112,16 @@ password = 相機密碼
 
 ---
 
+### 2-5. 環境自我檢查（新電腦 / 到現場必跑）
+
+```bat
+.\check.bat
+```
+
+逐項檢查 Python 套件、三個 exe、`config.ini` 帳密、wsdl、**8 台 PTZ 直連（網路 + 帳密）**、go2rtc 轉流、解碼後端、NAS，每項印 `[ OK ]` / `[FAIL]` / `[WARN]` 和修正方式。最後一行顯示「全部通過」，App 開起來 8 台才會有畫面。
+
+**常見狀況：只有 Ptz02、Ptz06 有畫面，其他顯示「連線失敗」** → 這兩台相機不需要帳密，其他 6 台需要。代表 `config.ini` 沒建立、仍是範本值，或帳密打錯，不是網路問題。App 啟動時會跳「相機帳密未設定」視窗；連線失敗的格子也會用黃字寫出原因，例如「帳密錯誤（401）」或「網路不通」。
+
 ## 3. 執行
 
 **終端機**（要在專案根目錄執行；`icons/`、`wsdl/`、`ffmpeg.exe` 等都是相對於工作目錄找的）：
@@ -252,6 +262,7 @@ main.py                     進入點；建三個分頁、啟動/收 go2rtc、GC
 main_window.ui / _ui.py     外框（QTabWidget），可 pyuic5 重生
 compile.bat                 只重生 main_window_ui.py（勿碰 ptz_control_ui.py）
 install.bat / start.bat     用 uv 建 .venv (Python 3.14) / 啟動
+check.bat / check_env.py    環境自我檢查（exe、帳密、8 台相機、go2rtc）
 packing.bat / main.spec     PyInstaller onefile 打包
 config.example.ini          相機帳密範本 → 複製成 config.ini（不進版控）
 .vscode/                    VS Code 啟動設定（launch.json）與建議擴充套件
@@ -271,6 +282,7 @@ utils/
   app_config.py             讀 config.ini / 環境變數取得相機帳密
   icons_utils.py            resource_path（開發 / PyInstaller 兩用）
   ui_utils.py               _ensure_pixitem
+  camera_check.py           連線失敗時繞過 go2rtc 直連相機，判斷是帳密錯誤還是網路不通
 
 wsdl/                        ONVIF WSDL（onvif_zeep 需要，路徑顯式指過去）
 icons/                       按鈕圖示 PNG

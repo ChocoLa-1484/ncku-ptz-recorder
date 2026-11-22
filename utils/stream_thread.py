@@ -197,7 +197,9 @@ def camera_worker_process(
         # 失敗就 fallback 軟解，再失敗就純預設構造。
         params = []
         if _OPEN_TIMEOUT is not None:
-            params += [_OPEN_TIMEOUT, 5000]
+            # go2rtc 模式第一次被連時才去連相機，實測要 1~4 秒；8 台同時開會更久。
+            # 原本 5s 太緊、偶發「無法連線」，放寬到 15s（連不上的相機最多多等 10s）。
+            params += [_OPEN_TIMEOUT, 15000 if USE_GO2RTC else 5000]
         if _HW_ACCEL is not None and _HW_D3D11 is not None:
             try:
                 cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG,
@@ -254,7 +256,19 @@ def camera_worker_process(
     # ── 用 cv2 探測一次取得解析度／確認攝影機可連線，之後完全走 ffmpeg subprocess ─
     cap = _connect()
     if cap is None:
-        print(f"[{camera_name}] Worker 無法連線攝影機。")
+        # 繞過 go2rtc 直接問相機，找出原因（帳密錯 / 網路不通…）回報給 UI
+        try:
+            from .camera_check import diagnose_camera
+            _ok, _reason = diagnose_camera(camera_ip, rtsp_user, rtsp_pass, rtsp_port)
+            if _ok:
+                _reason = "相機本身正常，但經 go2rtc 開串流失敗（稍後會自動重試）"
+        except Exception as e:
+            _reason = f"診斷失敗：{e}"
+        print(f"[{camera_name}] Worker 無法連線攝影機 → {_reason}")
+        try:
+            result_queue.put({"type": "conn_error", "msg": _reason})
+        except Exception:
+            pass
         return
     _fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     _fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -744,6 +758,8 @@ class StreamThread(QThread):
         self.running      = True
         self.worker_process = None
         self.last_recording_path: Optional[str] = None
+        # worker 連不上時回報的原因（例如「帳密錯誤（401）…」），給 UI 顯示
+        self.last_error: Optional[str] = None
         # UI 端丟舊幀用：True = UI 主執行緒還在畫上一張，run() 就跳過新幀，
         # 避免 image_signal 的 queued connection 無上限累積 → 預覽慢動作/延遲。
         self._ui_busy = False
@@ -807,30 +823,40 @@ class StreamThread(QThread):
                     self.image_signal.emit(qimg)
 
             try:
-                result = self.result_queue.get_nowait()
-                rtype = result.get("type")
-                if rtype == "rec_path":
-                    self.last_recording_path = result["path"]
-                elif rtype == "rec_error":
-                    self.recording_error.emit(result["msg"])
-                elif rtype == "nas_copy_started":
-                    self.nas_copy_status.emit("started", result.get("dst", ""))
-                elif rtype == "nas_copy_done":
-                    # 把 last_recording_path 從 staging 更新成 NAS 最終位置
-                    # （playback / 後續處理拿到的就是 NAS 上那支檔）
-                    self.last_recording_path = result["dst"]
-                    self.nas_copy_status.emit("done", result["dst"])
-                elif rtype == "nas_copy_error":
-                    # 複製失敗：保留 local 路徑當 fallback，讓使用者至少有本機檔可用
-                    self.last_recording_path = result.get("local_path") or self.last_recording_path
-                    # 只發 nas_copy_status；由分頁決定怎麼提示（多機分頁會彙整成一個視窗，
-                    # 不再每台各跳一次 recording_error）
-                    self.nas_copy_status.emit("error", result["msg"])
+                self._handle_result(self.result_queue.get_nowait())
             except queue.Empty:
                 pass
 
             if self.worker_process and not self.worker_process.is_alive():
+                # worker 剛結束時訊息（例如 conn_error 連線失敗原因）可能還在 queue 裡，收尾讀完
+                try:
+                    while True:
+                        self._handle_result(self.result_queue.get(timeout=0.3))
+                except queue.Empty:
+                    pass
                 break
+
+    def _handle_result(self, result: dict):
+        rtype = result.get("type")
+        if rtype == "conn_error":
+            self.last_error = result.get("msg")
+        elif rtype == "rec_path":
+            self.last_recording_path = result["path"]
+        elif rtype == "rec_error":
+            self.recording_error.emit(result["msg"])
+        elif rtype == "nas_copy_started":
+            self.nas_copy_status.emit("started", result.get("dst", ""))
+        elif rtype == "nas_copy_done":
+            # 把 last_recording_path 從 staging 更新成 NAS 最終位置
+            # （playback / 後續處理拿到的就是 NAS 上那支檔）
+            self.last_recording_path = result["dst"]
+            self.nas_copy_status.emit("done", result["dst"])
+        elif rtype == "nas_copy_error":
+            # 複製失敗：保留 local 路徑當 fallback，讓使用者至少有本機檔可用
+            self.last_recording_path = result.get("local_path") or self.last_recording_path
+            # 只發 nas_copy_status；由分頁決定怎麼提示（多機分頁會彙整成一個視窗，
+            # 不再每台各跳一次 recording_error）
+            self.nas_copy_status.emit("error", result["msg"])
 
     def start_recording(self, path=None, target_seconds=None, target_fps=120.0,
                         frame_size=(1920, 1080), fourcc="avc1",
