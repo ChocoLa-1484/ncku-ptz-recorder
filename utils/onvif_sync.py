@@ -10,6 +10,10 @@
 同時經 go2rtc 傳到各自的錄影 ffmpeg → 起錄對齊。
 
 僅在 USE_GO2RTC 時使用。media service 連線會被快取重用（避免每次錄影重連的 jitter）。
+
+⚠ 實測（2026-11，Ptz01~08）：相機回應 SetSynchronizationPoint 成功，但錄到的關鍵幀
+仍固定每 1.000 s 一個，沒有插入新的 I-frame → 這招對這批相機無效（無害，保留）。
+起錄散 0~1 s 改由 playback_tab 的 PTS 對齊（ALIGN_MODE="pts"）處理。
 """
 import os
 import time

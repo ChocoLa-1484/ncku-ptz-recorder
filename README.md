@@ -15,7 +15,7 @@ PyQt5 GUI，錄影與解碼交給 ffmpeg 子行程，可選用 go2rtc 做本機 
 | OS | Windows 10/11 |
 | Python | **3.14**，裝在專案根目錄的 `.venv\`。建議用 [uv](https://docs.astral.sh/uv/) 建立（會自動下載 Python 3.14，不用另外安裝）。早期的 conda `ptz` 3.9 環境已棄用 |
 | GPU | Intel iGPU（Iris Xe 等），預覽/回放解碼走 QSV（`h264_qsv`）。建議在 Windows 圖形設定把 `python.exe` / 打包後 exe 設「省電」強制走 iGPU。沒有 Intel iGPU 時 `utils/hwaccel.py` 會自動改用 NVIDIA CUDA（NVDEC），再不行才用 CPU 軟解；可用環境變數 `PTZ_HWACCEL=qsv/cuda/sw` 強制指定 |
-| 網路 | 與相機同網段（預設 `10.30.3.0/24`），RTSP 走 TCP |
+| 網路 | **接場館區網**，與相機同網段（預設 `10.30.3.0/24`），RTSP 走 TCP。8 台 1080p120 合計約 50~65 Mbps；經 VPN / 校園路由（ping > 5 ms）實測只撐約 2 台，8 台同時錄每台只收到 2~5 成的幀。`check.bat` 第 7 項會檢查 |
 | 硬碟 | 錄影檔很大（1080p120，~1.5 GB/分/路）；NAS 模式先寫本機 TEMP 再背景複製 |
 
 外部執行檔（**很大、不進版控**，下載方式見 [2-3](#2-3-外部執行檔必要)）：
@@ -118,7 +118,9 @@ password = 相機密碼
 .\check.bat
 ```
 
-逐項檢查 Python 套件、三個 exe、`config.ini` 帳密、wsdl、**8 台 PTZ 直連（網路 + 帳密）**、go2rtc 轉流、解碼後端、NAS，每項印 `[ OK ]` / `[FAIL]` / `[WARN]` 和修正方式。最後一行顯示「全部通過」，App 開起來 8 台才會有畫面。
+逐項檢查 Python 套件、三個 exe、`config.ini` 帳密、wsdl、**8 台 PTZ 直連（網路 + 帳密）**、go2rtc 轉流、**8 台同時收流（頻寬）**、解碼後端、NAS，每項印 `[ OK ]` / `[FAIL]` / `[WARN]` 和修正方式。最後一行顯示「全部通過」，App 開起來 8 台才會有畫面、錄影才不會掉幀。
+
+> 單台連得上不代表 8 台能同時錄：第 7 項同時收 8 路 8 秒，任一台收到的幀 < 95% 就是頻寬不足（通常是沒接場館區網、走 VPN 或 Wi-Fi）。
 
 **常見狀況：只有 Ptz02、Ptz06 有畫面，其他顯示「連線失敗」** → 這兩台相機不需要帳密，其他 6 台需要。代表 `config.ini` 沒建立、仍是範本值，或帳密打錯，不是網路問題。App 啟動時會跳「相機帳密未設定」視窗；連線失敗的格子也會用黃字寫出原因，例如「帳密錯誤（401）」或「網路不通」。
 
@@ -154,7 +156,7 @@ password = 相機密碼
 |---|---|---|
 | 單機攝影機 | `ptz_control/camera_tab_control.py` | 選一台相機看大畫面、ONVIF PTZ 方向/zoom 控制（限 `Ptz*`）、單路錄影。錄影中會顯示紅點 `recording_status_label` |
 | 多機攝影機 | `ptz_control/multi_camera_tab.py` | 2×4 格線同時預覽 8 台 `Ptz01~Ptz08`、勾選多台同步錄影、可勾選要不要連線（壓力測試承載上限）。點格子會開「放大」分頁（`enlarge_tab.py`） |
-| 同步播放 | `playback_tab.py` | 選一個錄影資料夾，依相機名前綴配對 mp4，8 路同步回放。用「各檔時長差 = 起錄差」把 8 路 trim 對齊（`ALIGN_BY_DURATION`） |
+| 同步播放 | `playback_tab.py` | 選一個錄影資料夾，依相機名前綴配對 mp4，8 路同步回放。依各檔第一幀的時間戳記（PTS `start_time`）對齊（`ALIGN_MODE = "pts"`），見下方「多路同步」 |
 
 ---
 
@@ -181,7 +183,15 @@ password = 相機密碼
 - `True`：`main.py` 啟動時跑 `go2rtc.exe -config go2rtc.yaml`，所有 RTSP 改連 `rtsp://127.0.0.1:8554/<camera_name>`。每台相機只被 go2rtc 連**一次**再分流給預覽+錄影 → 錄影時開預覽較不掉幀。除錯頁：`http://127.0.0.1:1984`。
 - `False`：直連相機（`rtsp://user:pwd@ip:554/stream0`），錄影時強制暫停預覽（相機被連兩次會掉幀）。
 
-go2rtc 模式下起錄時，`utils/onvif_sync.py` 的 `KeyframeSyncer` 會用 ONVIF `SetSynchronizationPoint` 命令 8 台同時送 I-frame，把起錄時間對齊（解 go2rtc 起錄散 ~1s 的問題）。
+go2rtc 模式下起錄時，`utils/onvif_sync.py` 的 `KeyframeSyncer` 會用 ONVIF `SetSynchronizationPoint` 命令 8 台同時送 I-frame。**實測（2026-11）這批相機會回應成功但不會真的插 I-frame**（關鍵幀仍固定每 1.000 s 一個），所以起錄仍會散 0~1 s（GOP 1 s），由回放對齊處理，見下方。
+
+### 多路同步（錄影 → 回放）
+
+- 多機分頁按「開始選取錄影」後，8 個錄影 ffmpeg 在同一時刻（`start_at − 2s` spin-wait）啟動；各檔的 PTS=0 就是這一刻。
+- `-c copy` 會丟掉第一個 keyframe 之前的封包，所以每支檔的第一幀 PTS（`start_time`）= 該台等到 keyframe 的時間，0~1 s 不等。
+- 同步播放以 PTS 為共同時間軸：從最晚開始的那支起播，各支往後跳 `共同起點 − 自己的 start_time`。
+- 驗證方式：把同一段畫面推成 8 路（keyframe 相位各自錯開 0.13 s）、用 App 錄影，再逐幀比對回放畫面 → 8 路對齊誤差 ≤ 33 ms（回放 60 fps 的 1~2 格）。
+- 舊作法「時長差 = 起錄差」（假設同時停錄）已棄用：實測 8 個 ffmpeg 同一毫秒收到 `q`，最後一幀仍差到 ~0.4 s，回放誤差最大 ~0.33 s。可在 `playback_tab.py` 把 `ALIGN_MODE` 改回 `"duration"`。
 
 ### NAS staging
 

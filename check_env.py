@@ -5,7 +5,7 @@
 逐項檢查並告訴你哪裡有問題、要怎麼修：
   1. Python 套件      2. ffmpeg / ffprobe / go2rtc     3. config.ini 帳密
   4. wsdl 檔名        5. 8 台 PTZ：網路、RTSP 帳密、ONVIF port
-  6. go2rtc 轉流      7. 解碼後端（QSV / CUDA / CPU）  8. NAS 路徑（僅提醒）
+  6. go2rtc 轉流      7. 8 台同時收流（頻寬）  8. 解碼後端  9. NAS（僅提醒）
 全部 OK 才代表 App 開起來 8 台會有畫面。
 """
 import os
@@ -167,16 +167,58 @@ else:
     finally:
         stop_go2rtc(proc)
 
-# ── 7. 解碼後端 ──────────────────────────────────────────────────
-section("7. 預覽解碼後端")
+# ── 7. 8 台同時收流（頻寬）────────────────────────────────────────
+# 單台能連 ≠ 8 台同時錄得完整：每台 1080p120 約 6~8 Mbps，8 台約 50~65 Mbps。
+# 實測（2026-11）經 VPN / 校園路由連相機只撐約 15~20 Mbps：單台 100%，8 台同時每台只收到
+# 20~37% 的幀 → 錄影嚴重掉幀。場館區網（1 Gbps、ping < 1 ms）才撐得住。
+section("7. 8 台同時收流（頻寬，約 10 秒）")
+RECV_SECS = 8
+if not exe_ok.get("ffmpeg.exe"):
+    report(False, "頻寬測試", "缺 ffmpeg.exe，跳過")
+elif tcp_open("127.0.0.1", 8554, 0.5):
+    report(None, "頻寬測試", "App 可能正在執行（8554 被佔用），跳過；請關掉 App 再檢查")
+else:
+    import re
+
+    def rtt_ms(ip):
+        t = time.perf_counter()
+        ok = tcp_open(ip, 554, 2.0)
+        return (time.perf_counter() - t) * 1000 if ok else None
+
+    rtts = [r for r in (rtt_ms(ip) for _, ip in PTZ) if r is not None]
+    if rtts:
+        med = sorted(rtts)[len(rtts) // 2]
+        report(True if med < 5 else None, f"到相機的連線延遲 {med:.1f} ms",
+               "區網" if med < 5 else "偏高：這台電腦可能不在場館區網（經 VPN / 跨網段），8 台同時錄可能掉幀")
+
+    def recv(name_ip):
+        name, ip = name_ip
+        url = f"rtsp://{user}:{pwd}@{ip}:554/stream0"
+        r = subprocess.run([os.path.abspath("ffmpeg.exe"), "-hide_banner", "-rtsp_transport", "tcp",
+                            "-i", url, "-t", str(RECV_SECS), "-map", "0:v:0", "-c", "copy", "-f", "null", "-"],
+                           capture_output=True, timeout=RECV_SECS + 40, creationflags=_NO_WINDOW)
+        fr = re.findall(r"frame=\s*(\d+)", r.stderr.decode(errors="replace"))
+        return name, int(fr[-1]) if fr else 0
+
+    with cf.ThreadPoolExecutor(8) as ex:
+        got = list(ex.map(recv, PTZ))
+    want = RECV_SECS * 120
+    for name, n in got:
+        ratio = n / want
+        report(ratio >= 0.95, f"{name} 8 台同時收流",
+               f"{n}/{want} 幀（{ratio:.0%}）" + ("" if ratio >= 0.95 else
+               " → 頻寬不足，錄影會掉幀。請接場館區網（不要走 VPN / Wi-Fi）"))
+
+# ── 8. 解碼後端 ──────────────────────────────────────────────────
+section("8. 預覽解碼後端")
 if exe_ok.get("ffmpeg.exe"):
     from utils.hwaccel import get_hwaccel
     hw = get_hwaccel(os.path.abspath("ffmpeg.exe"))
     report(True if hw != "sw" else None, f"解碼 = {hw}",
            {"qsv": "Intel iGPU", "cuda": "NVIDIA GPU", "sw": "CPU 軟解（8 路可能吃緊）"}[hw])
 
-# ── 8. NAS ───────────────────────────────────────────────────────
-section("8. NAS 存檔位置")
+# ── 9. NAS ───────────────────────────────────────────────────────
+section("9. NAS 存檔位置")
 nas_root = os.path.splitdrive(r"Z:\PTZ recordings")[0] + "\\"
 report(True if os.path.isdir(nas_root) else None, f"NAS {nas_root}",
        "存在" if os.path.isdir(nas_root) else "不存在（錄影前 App 會問要改存桌面或自選資料夾）")

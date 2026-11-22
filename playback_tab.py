@@ -30,10 +30,17 @@ BUFFER_SECONDS    = 3                                   # 每路 ring buffer 緩
 TIMER_INTERVAL_MS = max(1, int(1000 / DISPLAY_FPS))     # 60 Hz tick (~17 ms)
 UI_REFRESH_MS     = 200                                 # 進度條 / 時間文字 5 Hz 更新
 
-# Method 2 同步對齊：假設 8 台同步停錄，則「各檔時長差 = 起錄差」。
-# 載入時把每支往前 trim 掉 (自己時長 − 最短時長)，讓 8 路對齊到共同起點。
-# 主要用於 go2rtc 模式（起錄散到 ~1s）；直連錄影差很小、套了也無害。設 False 可關閉。
-ALIGN_BY_DURATION = True
+# 多路同步對齊方式（2026-11 實測修正）：
+#   "pts"      （預設）依各檔「第一幀的時間戳記 start_time」對齊。
+#              多機分頁起錄時 8 個錄影 ffmpeg 在同一時刻啟動，檔案 PTS=0 就是那一刻，
+#              第一幀的 PTS = 該台等到第一個 keyframe 的時間（相機 GOP 1s → 0~1s 不等）。
+#              以「同一畫面推成 8 路、keyframe 相位各自錯開」的模擬逐幀驗證：對齊誤差 ≤ 25 ms。
+#   "duration" 舊作法：假設同步停錄 → 時長差 = 起錄差。實測 8 個 ffmpeg 就算同一毫秒收到
+#              'q'，最後一幀仍會差到 ~0.4 s（go2rtc/ffmpeg 緩衝），對齊誤差最大 ~0.33 s，已棄用。
+#   "none"     不對齊，各檔都從頭播。
+# start_time 異常（例如混到不同場次的檔案、找不到重疊區段）時自動退回 "duration"。
+ALIGN_MODE = "pts"
+ALIGN_BY_DURATION = ALIGN_MODE != "none"   # 舊名稱，保留相容
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -54,7 +61,9 @@ _FFPROBE_EXE = _resolve_ffprobe_exe()
 
 # ────────────────────────── 探測檔案資訊（不解碼） ──────────────────────────
 def _probe_file(path: str) -> tuple:
-    """回傳 (duration_ms, fps)。優先用 ffprobe，失敗就 parse ffmpeg stderr 兜底。"""
+    """回傳 (duration_ms, fps, start_ms)。優先用 ffprobe，失敗就 parse ffmpeg stderr 兜底
+    （兜底時 start_ms 為 None → 無法用 PTS 對齊）。
+    start_ms = 檔案第一幀的時間戳記（format.start_time），ffmpeg 的 -ss 是從這裡起算。"""
     try:
         out = subprocess.run(
             [_FFPROBE_EXE, "-v", "quiet", "-print_format", "json",
@@ -63,6 +72,10 @@ def _probe_file(path: str) -> tuple:
         )
         data = json.loads(out.stdout)
         duration_s = float(data["format"]["duration"])
+        try:
+            start_ms = float(data["format"]["start_time"]) * 1000.0
+        except (KeyError, TypeError, ValueError):
+            start_ms = None
         fps = 30.0
         for stream in data.get("streams", []):
             if stream.get("codec_type") == "video":
@@ -73,7 +86,7 @@ def _probe_file(path: str) -> tuple:
                 except Exception:
                     fps = 30.0
                 break
-        return duration_s * 1000.0, fps
+        return duration_s * 1000.0, fps, start_ms
     except Exception:
         pass
     try:
@@ -89,9 +102,9 @@ def _probe_file(path: str) -> tuple:
             dur_s = int(h) * 3600 + int(mn) * 60 + float(s)
         m = re.search(r"(\d+(?:\.\d+)?)\s+fps", text)
         fps = float(m.group(1)) if m else 30.0
-        return dur_s * 1000.0, fps
+        return dur_s * 1000.0, fps, None
     except Exception:
-        return 0.0, 30.0
+        return 0.0, 30.0, None
 
 
 # ────────────────────────── 單路 lazy decoder ──────────────────────────
@@ -263,8 +276,8 @@ class _ProbeThread(QThread):
         info: Dict[str, Dict] = {}
         max_dur = 0.0
         for name, path in self.files.items():
-            dur_ms, fps = _probe_file(path)
-            info[name] = {"duration_ms": dur_ms, "fps": fps, "path": path}
+            dur_ms, fps, start_ms = _probe_file(path)
+            info[name] = {"duration_ms": dur_ms, "fps": fps, "path": path, "start_ms": start_ms}
             if dur_ms > max_dur:
                 max_dur = dur_ms
         self.done.emit(info, max_dur)
@@ -487,15 +500,7 @@ class PlaybackTab(QWidget):
             return
         self._video_info  = info
 
-        # Method 2 同步對齊：假設同步停錄 → 時長差 = 起錄差。各台往前 trim
-        # (自己時長 − 最短時長)，對齊到共同起點；對齊後可播長度 = 最短時長。
-        durs = {n: m["duration_ms"] for n, m in info.items()}
-        min_dur = min(durs.values()) if durs else 0.0
-        self._offset_ms = {n: (d - min_dur if ALIGN_BY_DURATION else 0.0)
-                           for n, d in durs.items()}
-        self._duration_ms = min_dur if ALIGN_BY_DURATION else max_dur_ms
-        if ALIGN_BY_DURATION and durs:
-            print(f"[playback] 8 檔時長差 {(max(durs.values())-min_dur)/1000:.3f}s → 套用起錄對齊 trim")
+        self._offset_ms, self._duration_ms = self._compute_alignment(info, max_dur_ms)
 
         # spawn decoders（從各自 offset 起，使 8 路對齊）
         for name, meta in info.items():
@@ -510,6 +515,34 @@ class PlaybackTab(QWidget):
         self.time_label.setText(f"00:00 / {total_str}")
         # 開始輪詢第一幀（避免阻塞 GUI 等 ffmpeg startup ~1s）
         self._first_frame_timer.start()
+
+    @staticmethod
+    def _compute_alignment(info: Dict[str, Dict], max_dur_ms: float):
+        """回傳 (offset_ms, duration_ms)。offset_ms[name] = 該檔要從自己開頭往後跳多少 ms
+        （傳給 ffmpeg -ss，-ss 從檔案第一幀起算），duration_ms = 對齊後可播長度。"""
+        durs = {n: m["duration_ms"] for n, m in info.items()}
+        if not durs or ALIGN_MODE == "none":
+            return {n: 0.0 for n in durs}, max_dur_ms
+
+        starts = {n: m.get("start_ms") for n, m in info.items()}
+        if ALIGN_MODE == "pts" and all(s is not None for s in starts.values()):
+            # 共同時間軸 = 檔案 PTS。每支的有效區間 [start, start+duration]，
+            # 取 8 支的交集：從最晚開始的那支起播，到最早結束的那支為止。
+            common_start = max(starts.values())
+            common_end = min(starts[n] + durs[n] for n in durs)
+            # 合理性檢查：同一次多機錄影的起點差應在幾秒內（GOP 1s）。差太多代表
+            # 檔案不是同一次起錄（例如資料夾混了單機錄影）→ 改用舊的時長對齊。
+            if common_end - common_start > 1000.0 and \
+                    common_start - min(starts.values()) < 5000.0:
+                offsets = {n: common_start - starts[n] for n in durs}
+                print(f"[playback] PTS 對齊：起點差 {(common_start - min(starts.values()))/1000:.3f}s，"
+                      f"可播 {(common_end - common_start)/1000:.1f}s")
+                return offsets, common_end - common_start
+            print("[playback] PTS 起點不合理，改用時長對齊")
+
+        min_dur = min(durs.values())
+        print(f"[playback] 時長對齊：時長差 {(max(durs.values()) - min_dur)/1000:.3f}s")
+        return {n: d - min_dur for n, d in durs.items()}, min_dur
 
     def _check_first_frames(self):
         if not self._decoders:
