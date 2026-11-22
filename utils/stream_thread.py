@@ -71,24 +71,112 @@ def _port_in_use(host: str, port: int) -> bool:
         return s.connect_ex((host, port)) == 0
 
 
+def _find_orphan_go2rtc_pids() -> List[int]:
+    """找出「父程序已經不存在」的 go2rtc.exe（Windows 限定）。
+
+    App 正常執行時，go2rtc 的父程序就是 App 本身；App 當掉 / 被強制停止後，go2rtc
+    會變成孤兒繼續跑。只挑孤兒，才不會誤殺「另一個正在執行（可能正在錄影）的 App」
+    底下的 go2rtc。打包成 exe 時 go2rtc 每次解壓到不同暫存資料夾，所以不比對路徑。
+
+    父程序 PID 可能被 Windows 重新分配給別的程式 → 再比較啟動時間：
+    「父程序」比 go2rtc 晚啟動，代表那只是重用了同一個 PID，實際上仍是孤兒。
+    無法取得資訊（例如權限不足）的程序一律不動。
+    """
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return []
+    procs = {}   # pid -> (ppid, exe name)
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            procs[entry.th32ProcessID] = (entry.th32ParentProcessID, entry.szExeFile)
+            ok = k32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+
+    def _created(pid):
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return None
+        try:
+            t = [wintypes.FILETIME() for _ in range(4)]
+            if not k32.GetProcessTimes(h, *[ctypes.byref(x) for x in t]):
+                return None
+            return (t[0].dwHighDateTime << 32) | t[0].dwLowDateTime
+        finally:
+            k32.CloseHandle(h)
+
+    orphans = []
+    for pid, (ppid, exe) in procs.items():
+        if exe.lower() != "go2rtc.exe":
+            continue
+        child_t = _created(pid)
+        if child_t is None:
+            continue                      # 讀不到（權限不足等）→ 不碰
+        if ppid not in procs:
+            orphans.append(pid)           # 父程序已不存在
+            continue
+        parent_t = _created(ppid)
+        if parent_t is not None and parent_t > child_t:
+            orphans.append(pid)           # 父 PID 被重用，原本的父程序已結束
+    return orphans
+
+
 def _kill_stale_go2rtc():
     """關掉上次 App 沒正常結束（當掉 / 強制停止除錯）留下的 go2rtc.exe。
 
     殘留的舊 go2rtc 會繼續佔著 8554 埠，新啟動的 go2rtc 綁不到埠，App 就一直連到
     那個舊的；舊的若卡在壞狀態，部分相機會回 RTSP 404（實際遇過：Ptz01/03/04/05/07/08
     連不上、02/06 正常，而直連相機全部正常）。
+
+    只關「孤兒」go2rtc（見 _find_orphan_go2rtc_pids），另一個仍在執行的 App 底下的
+    go2rtc 不會被關掉，避免中斷它正在進行的預覽 / 錄影。
     """
-    if os.name != "nt":
-        return
     try:
-        r = subprocess.run(["taskkill", "/F", "/IM", "go2rtc.exe"],
-                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                           timeout=10, creationflags=_NO_WINDOW)
+        pids = _find_orphan_go2rtc_pids()
     except Exception as e:
-        print(f"[go2rtc] 清除殘留 go2rtc 失敗: {e}")
+        print(f"[go2rtc] 檢查殘留 go2rtc 失敗: {e}")
         return
-    if r.returncode == 0:
-        print("[go2rtc] 已關閉上次殘留的 go2rtc.exe")
+    killed = 0
+    for pid in pids:
+        try:
+            r = subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=10, creationflags=_NO_WINDOW)
+            if r.returncode == 0:
+                killed += 1
+        except Exception as e:
+            print(f"[go2rtc] 關閉殘留 go2rtc (PID {pid}) 失敗: {e}")
+    if killed:
+        print(f"[go2rtc] 已關閉 {killed} 個上次殘留的 go2rtc.exe")
         # 等 OS 釋放埠
         for _ in range(20):
             if not _port_in_use(GO2RTC_HOST, GO2RTC_PORT):
@@ -109,8 +197,9 @@ def maybe_start_go2rtc():
         return None
     _kill_stale_go2rtc()
     if _port_in_use(GO2RTC_HOST, GO2RTC_PORT):
-        print(f"[go2rtc] 警告：{GO2RTC_HOST}:{GO2RTC_PORT} 已被其他程式佔用，"
-              f"App 可能連到錯的 RTSP 服務。請用 `netstat -ano | findstr {GO2RTC_PORT}` 找出並關閉它。")
+        print(f"[go2rtc] 警告：{GO2RTC_HOST}:{GO2RTC_PORT} 已被佔用（可能是另一個正在執行的 App，"
+              f"或其他程式），這次會共用那個 RTSP 服務。若連線異常，請用 "
+              f"`netstat -ano | findstr {GO2RTC_PORT}` 找出佔用的程式；若是另一個 App 正在錄影，請勿直接關閉。")
     try:
         # go2rtc.yaml 用 ${PTZ_CAMERA_USER} / ${PTZ_CAMERA_PASS} 取帳密，這裡從 config.ini 帶入環境變數
         user, pwd = get_camera_credentials()
