@@ -334,10 +334,35 @@ class PtzTabControl(QWidget):
             self._on_connect_success(None, ip, name)
             return
 
-        self.connect_worker = CameraConnectWorker(ip)
-        self.connect_worker.finished.connect(lambda ctrl: self._on_connect_success(ctrl, ip, name))
-        self.connect_worker.failed.connect(lambda msg: self._on_connect_fail(msg, ip, name))
-        self.connect_worker.start()
+        # 加快連線：串流先開（不等 ONVIF），ONVIF PTZ 在背景同時連線，連上後再啟用方向鍵。
+        # 原本是「ONVIF 連完 → 才開串流」，網路差時 ONVIF 要 0.5~1.5 秒，畫面就晚這麼久。
+        self._on_connect_success(None, ip, name)
+
+        worker = CameraConnectWorker(ip)
+        self.connect_worker = worker
+        worker.finished.connect(lambda ctrl, w=worker: self._on_ptz_ready(ctrl, w, name))
+        worker.failed.connect(lambda msg, w=worker: self._on_ptz_fail(msg, w))
+        worker.start()
+
+    def _ptz_result_still_valid(self, worker) -> bool:
+        """ONVIF 結果回來時，使用者可能已停止串流或換了相機 → 這個結果就作廢。"""
+        return (worker is self.connect_worker and self.streaming
+                and self.stream_thread is not None)
+
+    def _on_ptz_ready(self, ptz_ctrl, worker, name):
+        if not self._ptz_result_still_valid(worker):
+            return
+        self.ptz_control = ptz_ctrl
+        self._enable_control_buttons()
+        self.btn_imaging.setEnabled(name.startswith("Ptz"))
+
+    def _on_ptz_fail(self, error_msg, worker):
+        if not self._ptz_result_still_valid(worker):
+            return
+        print(f"PTZ Connection Failed: {error_msg}")
+        # 串流已經在跑（純視頻模式），只提示 PTZ 控制不可用
+        QMessageBox.warning(self, "PTZ 連線失敗",
+            f"PTZ 控制連線失敗，維持純視頻模式（可看畫面、可錄影）：\n{error_msg}")
 
     def _on_connect_success(self, ptz_ctrl, ip, name):
         self._close_stream_thread()
@@ -349,6 +374,7 @@ class PtzTabControl(QWidget):
         self.stream_thread = StreamThread(
             scene=self.scene, view=self.view, camera_ip=ip, camera_name=name,
             ui_fps=30, preview_size=(1280, 720),
+            low_latency=True,   # 單機預覽：低延遲模式（多攝分頁不傳，維持原本 jitter buffer）
         )
         self.stream_thread.recording_error.connect(
             lambda msg: QMessageBox.warning(self, "錄影錯誤", msg)

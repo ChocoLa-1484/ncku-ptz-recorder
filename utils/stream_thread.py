@@ -146,7 +146,11 @@ def camera_worker_process(
     camera_ip: str, camera_name: str, rtsp_user: str, rtsp_pass: str, rtsp_port: int,
     ui_fps: int, preview_hw: tuple,
     frame_queue: mp.Queue, cmd_queue: mp.Queue, result_queue: mp.Queue,
+    low_latency: bool = False,
 ):
+    # low_latency=True（單機分頁用）：ffmpeg 不做輸入緩衝、UI 只顯示最新一張，
+    #   延遲最低，但網路抖動或 I-frame burst 時畫面可能頓一下。
+    # low_latency=False（預設，多攝分頁用）：維持原本的 jitter buffer 行為，畫面順但延遲較高。
     # 把 stderr 重導向 devnull，消除 OpenCV/FFmpeg 解碼器的 av_log 警告訊息。
     # print() 走 stdout（fd 1），不受影響；FFmpeg 子進程有獨立 pipe 也不受影響。
     try:
@@ -253,9 +257,7 @@ def camera_worker_process(
             try: proc.stderr.close()
             except OSError: pass
 
-    # ── 用 cv2 探測一次取得解析度／確認攝影機可連線，之後完全走 ffmpeg subprocess ─
-    cap = _connect()
-    if cap is None:
+    def _report_conn_error():
         # 繞過 go2rtc 直接問相機，找出原因（帳密錯 / 網路不通…）回報給 UI
         try:
             from .camera_check import diagnose_camera
@@ -263,19 +265,32 @@ def camera_worker_process(
             if _ok:
                 _reason = "相機本身正常，但經 go2rtc 開串流失敗（稍後會自動重試）"
         except Exception as e:
-            _reason = f"診斷失敗：{e}"
+            _ok, _reason = False, f"診斷失敗：{e}"
         print(f"[{camera_name}] Worker 無法連線攝影機 → {_reason}")
         try:
             result_queue.put({"type": "conn_error", "msg": _reason})
         except Exception:
             pass
+        return _ok
+
+    # 低延遲模式（單機分頁）且已指定預覽尺寸：跳過 cv2 探測，直接啟動預覽 ffmpeg。
+    # 探測只是為了拿解析度，但預覽尺寸已固定；省掉一次「經 go2rtc 開串流再關掉」約 1~3 秒。
+    # 連不上的情況改由下面的「第一次就失敗 → 診斷」處理。多攝分頁（low_latency=False）照舊探測。
+    _skip_probe = low_latency and preview_hw[0] > 0
+    cap = None if _skip_probe else _connect()
+    if _skip_probe:
+        pass
+    elif cap is None:
+        _report_conn_error()
         return
-    _fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    _fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    _src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
-    if _fw > 0 and _fh > 0:
-        frame_w, frame_h = _fw, _fh
-    cap.release()  # 不再用 cv2 讀，釋放掉
+    _src_fps = 0.0
+    if cap is not None:
+        _fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        _fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        _src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+        if _fw > 0 and _fh > 0:
+            frame_w, frame_h = _fw, _fh
+        cap.release()  # 不再用 cv2 讀，釋放掉
 
     # preview_hw=(w,h) → ffmpeg 縮到指定尺寸；(0,0) → 保持原解析度
     _pw, _ph = preview_hw
@@ -295,6 +310,7 @@ def camera_worker_process(
     preview_stderr_thread  = None
     preview_stop_event     = threading.Event()
     preview_paused         = False
+    got_first_frame        = threading.Event()   # 低延遲模式：用來判斷「第一次連線就失敗」
 
     def _spawn_preview():
         # 關鍵 flags（驗證過的）：
@@ -309,8 +325,14 @@ def camera_worker_process(
         #   stderr=PIPE + drain thread：上次失敗就是 DEVNULL 把 QSV 錯誤吃光。
         #   非 Intel 機器（無 iGPU）由 utils/hwaccel.py 自動改走 cuda 或 CPU 軟解。
         vf = build_vf(_hw, ui_fps, (out_w, out_h) if _do_scale else None)
+        # 單機低延遲模式：恢復 nobuffer + low_delay，frame 一解出來就送出，不在 demuxer 排隊
+        # 另外把 probesize / analyzeduration 縮小（預設約 5MB / 5 秒），更早開始解碼出第一張
+        _latency_flags = (["-fflags", "nobuffer", "-flags", "low_delay",
+                           "-probesize", "500000", "-analyzeduration", "500000"]
+                          if low_latency else [])
         cmd = [
             _FFMPEG_EXE, "-hide_banner", "-loglevel", "error",
+            *_latency_flags,
             *decode_input_args(_hw),
             "-rtsp_transport", "tcp",
             # 拿掉 nobuffer + low_delay：原本為了低延遲，但讓 H.264 IDR keyframe burst
@@ -342,6 +364,7 @@ def camera_worker_process(
                         return  # ffmpeg 結束
                     data.extend(chunk)
                 frame = np.frombuffer(bytes(data), dtype=np.uint8).reshape((out_h, out_w, 3))
+                got_first_frame.set()
 
                 # 大尺寸預覽（單機 1280×720 以上）用較高 JPEG 品質；多攝小格 460×258 用 50 即可
                 ui_q = 70 if out_w >= 960 else 50
@@ -704,6 +727,10 @@ def camera_worker_process(
             print(f"[{camera_name}] 預覽 ffmpeg 結束 (code {rc})，"
                   f"嘗試重連 ({reconnect_count + 1}/{MAX_RETRIES})...")
             _stop_preview()
+            if _skip_probe and not got_first_frame.is_set() and reconnect_count == 0:
+                # 跳過探測後的替代檢查：只在第一次失敗時診斷一次，相機本身不通就不再白白重試
+                if not _report_conn_error():
+                    break
             reconnect_count += 1
             if reconnect_count >= MAX_RETRIES:
                 print(f"[{camera_name}] 達到重連上限，Worker 退出。")
@@ -730,6 +757,7 @@ class StreamThread(QThread):
         ui_fps: int = 15, use_substream: bool = False,
         preview_size: tuple = None,
         rtsp_username: Optional[str] = None, rtsp_password: Optional[str] = None, rtsp_port: int = 554,
+        low_latency: bool = False,
     ):
         super().__init__()
         if rtsp_username is None or rtsp_password is None:
@@ -751,7 +779,10 @@ class StreamThread(QThread):
         else:
             _preview_hw = (0, 0)
 
-        self.frame_queue  = mp.Queue(maxsize=12)   # jitter buffer：吸收 ffmpeg 的 burst（~0.4s 上限）
+        # low_latency：只留最新 1 張（滿了 reader 會丟最舊的），UI 永遠畫最新畫面
+        # 預設：jitter buffer 12 張，吸收 ffmpeg 的 burst（~0.4s 上限）
+        self.low_latency  = bool(low_latency)
+        self.frame_queue  = mp.Queue(maxsize=1 if self.low_latency else 12)
         self._display_fps = max(1, int(ui_fps))    # 預覽放出節拍 (fps)
         self.cmd_queue    = mp.Queue()
         self.result_queue = mp.Queue()
@@ -771,6 +802,7 @@ class StreamThread(QThread):
             self.src, self.camera_name, rtsp_username, rtsp_password, rtsp_port,
             ui_fps, _preview_hw,
             self.frame_queue, self.cmd_queue, self.result_queue,
+            self.low_latency,
         )
         self.image_signal.connect(self.update_ui_image)
 
@@ -799,6 +831,9 @@ class StreamThread(QThread):
         # 定時節拍器：以固定間隔從 jitter buffer 取「最舊一張」放出來，
         # 把 ffmpeg 一陣一陣吐幀(burst)抹平成順順的畫面（同 playback 的做法）。
         _interval = 1.0 / self._display_fps          # e.g. 30fps → 33ms
+        if self.low_latency:
+            # 低延遲：不用固定節拍放幀，每 5ms 檢查一次，有新幀就馬上畫（省掉最多 33ms 的等待）
+            _interval = 0.005
         _next_t   = time.perf_counter()
 
         while self.running:
@@ -814,6 +849,11 @@ class StreamThread(QThread):
             if not self._ui_busy:
                 try:
                     jpeg_bytes = self.frame_queue.get_nowait()
+                    if self.low_latency:
+                        # 低延遲：若累積了多張，全部丟掉只留最新一張
+                        while True:
+                            try: jpeg_bytes = self.frame_queue.get_nowait()
+                            except queue.Empty: break
                 except queue.Empty:
                     jpeg_bytes = None
                 if jpeg_bytes is not None:
